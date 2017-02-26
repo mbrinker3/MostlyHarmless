@@ -26,6 +26,7 @@ namespace MostlyHarmless
         private CommandCenter _Commander = new CommandCenter(new ThunderMissileLauncher());
         private Bitmap _trackingImage;
         private Bitmap _currentFrame;
+        private Bitmap _displayFrame;
         private ParticleFilter pf = null;
         private Thread _RocketTracking;
         VideoCaptureDevice videoSource = null;
@@ -35,11 +36,19 @@ namespace MostlyHarmless
         
         
         //Thread synchronization
-        private EventWaitHandle _Centered = new EventWaitHandle(false, EventResetMode.ManualReset);
+        //Signal that the filter
+        private EventWaitHandle _Centered = new EventWaitHandle(false, EventResetMode.ManualReset); 
+        //This one is used as a bit of a hack.  If a new frame starts getting drawn before the last one is finished, it throws an exception.
         EventWaitHandle _DrawingDelay = new EventWaitHandle(false, EventResetMode.ManualReset);
-        EventWaitHandle _FrameLock = new EventWaitHandle(true, EventResetMode.ManualReset);
+        //Signal a new frame is in use
+        EventWaitHandle _newFrame = new EventWaitHandle(true, EventResetMode.ManualReset);
+
+        Semaphore _frameLock = new Semaphore(1, 1);
+        //Filter is running
         private bool _ParticleFilterRunning = false;
+        //Event that signals when the filter is stopping, then again when it's done.
         private EventWaitHandle _Filterstopping = new EventWaitHandle(false, EventResetMode.ManualReset);
+        //Never gets set in the code.  This serves the same function Thread.sleep() might, but is a bit more reliable.
         EventWaitHandle Pause = new EventWaitHandle(false, EventResetMode.ManualReset);
 
         //Centering and guidance instructions
@@ -91,7 +100,7 @@ namespace MostlyHarmless
             SetStatus("Resetting", lblRocketStatus);
             _Commander.Reset();
             _Commander.Right(3000);
-            _Commander.Up(500);
+            _Commander.Up(100);
             SetStatus("Ready", lblRocketStatus);
         }
 
@@ -105,47 +114,45 @@ namespace MostlyHarmless
         NewFrameEventArgs eventArgs)
         {
             // get new frame
-            Bitmap bitmap = eventArgs.Frame;
-            _FrameLock.WaitOne();
-            _FrameLock.Reset();
-            _currentFrame = (Bitmap)bitmap.Clone();
-            _FrameLock.Set();
-            // process the frame
-            picBoxMain.Image = bitmap;
-            Graphics gf = picBoxMain.CreateGraphics();
-            //gf.Clear(picBoxMain.BackColor);
-            if (_ParticleFilterRunning)
+            if (picBoxMain.Image != null)
             {
-                try
+                picBoxMain.Image.Dispose();
+            }
+            _frameLock.WaitOne();
+            _currentFrame = (Bitmap)eventArgs.Frame.Clone();
+            picBoxMain.Image = _currentFrame;
+            _frameLock.Release();
+            _newFrame.Set();
+            // process the frame
+            using (Graphics gf = picBoxMain.CreateGraphics())
+            {
+                if (_ParticleFilterRunning && pf != null)
                 {
+                    _frameLock.WaitOne();
                     pf.markupImage(gf, currentCenter);
+                    float Confidence = pf.getConfidence();
                     int[] center = pf.findCenter();
-                    setTbox(pf.getConfidence().ToString(), tBoxConfidence);
+                    setTbox(Confidence.ToString(), tBoxConfidence);
                     setTbox(center[0].ToString() + "," + center[1].ToString(), tboxCenterCoordinates);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(ex.Message);
+                    if (pf._Centered)
+                    {
+                        _Centered.Set();
+                        SetStatus("Target Locked", lblStatus);
+                    }
+                    else
+                    {
+                        SetStatus("Looking for target", lblStatus);
+                        _Centered.Reset();
+                    }
+                    if (!_RocketTracking.IsAlive)
+                    {
+                        _RocketTracking.Start();
+                    }
+                    _frameLock.Release();
+
                 }
 
-                if (pf._Centered)
-                {
-                    _Centered.Set();
-                    SetStatus("Target Locked", lblStatus);
-                    btnFireRocket.Enabled = true;
-                }
-                else
-                {
-                    SetStatus("Looking for target", lblStatus);
-                    _Centered.Reset();
-                    btnFireRocket.Enabled = false;
-                }
-                if (!_RocketTracking.IsAlive)
-                {
-                    _RocketTracking.Start();
-                }
             }
-            _DrawingDelay.WaitOne(50);
 
         }
 
@@ -154,15 +161,16 @@ namespace MostlyHarmless
         /// </summary>
         private void TrackAndFireThread()
         {
+            _frameLock.WaitOne();
             currentCenter[0] = _currentFrame.Size.Width / 2;
             currentCenter[1] = _currentFrame.Size.Height / 2;
-            
+            _frameLock.Release();
+
             while(_ParticleFilterRunning)
             {
                 bool centered = _Centered.WaitOne(1000);
                 if (centered)
                 {
-                    _FrameLock.WaitOne();
                     int[] center = pf.findCenter();
                     int xoffset = currentCenter[0] - center[0];
                     int yoffset = currentCenter[1] - center[1];
@@ -171,24 +179,28 @@ namespace MostlyHarmless
                     if (xoffset > 1)
                     {
                         _Commander.Left(xoffset * _pixelsToMilliseconds);
+                        Pause.WaitOne(xoffset * 4); //movements get lost if they're sent too closely together
                     }
                     if (xoffset < 1)
                     {
                         xoffset = Math.Abs(xoffset);
                         _Commander.Right(xoffset * _pixelsToMilliseconds);
+                        Pause.WaitOne(xoffset * 4); //movements get lost if they're sent too closely together
 
                     }
                     if (yoffset > 1)
                     {
                         _Commander.Up(yoffset * _pixelsToMilliseconds);
+                        Pause.WaitOne(xoffset * 4); //movements get lost if they're sent too closely together
 
                     }
                     if (yoffset < 1)
                     {
                         yoffset = Math.Abs(yoffset);
                         _Commander.Down(yoffset * _pixelsToMilliseconds);
+                        Pause.WaitOne(xoffset * 4); //movements get lost if they're sent too closely together
                     }
-                    Pause.WaitOne(500);
+                    Pause.WaitOne(500);//Prevent Jerking motions
                 }
                 
 
@@ -259,7 +271,9 @@ namespace MostlyHarmless
             if (videoSource != null)
             {
                 videoSource.SignalToStop();
+                videoSource.NewFrame -= new NewFrameEventHandler(video_NewFrame);
                 videoSource.WaitForStop();
+                videoSource = null;
             }
             
         }
@@ -273,8 +287,8 @@ namespace MostlyHarmless
         {
             try
             {
-                _FrameLock.WaitOne();
-                _FrameLock.Reset();
+                _newFrame.WaitOne();
+                _newFrame.Reset();
                 FileDialog newImage = new OpenFileDialog();
                 newImage.Filter = "BMP Files (*.bmp) |*.bmp| JPEG Files (*.jpeg)|*.jpeg|PNG Files (*.png)|*.png|JPG Files (*.jpg)|*.jpg|GIF Files (*.gif)|*.gif|All files|*.*";
                 DialogResult result = newImage.ShowDialog();
@@ -285,12 +299,12 @@ namespace MostlyHarmless
                     picBoxTrackingImage.Size = s;
                     picBoxTrackingImage.Image = _trackingImage;
                 }
-                _FrameLock.Set();
+                _newFrame.Set();
             }
             catch(Exception ex)
             {
                 Console.WriteLine(ex.Message);
-                _FrameLock.Set();
+                _newFrame.Set();
             }
             
 
@@ -345,18 +359,20 @@ namespace MostlyHarmless
             {
                 if (_currentFrame != null && _trackingImage != null)
                 {
-                    _FrameLock.WaitOne();
-                    _FrameLock.Reset();
-                    Bitmap Frame = (Bitmap)_currentFrame.Clone();
+                    _newFrame.WaitOne();
+                    _newFrame.Reset();
+                    _frameLock.WaitOne();
+                    var Frame = (Bitmap)_currentFrame.Clone();
+                    _frameLock.Release();
                     if (pf == null)
                     {
                         Bitmap Template = (Bitmap)_trackingImage.Clone();
-                        pf = new ParticleFilter(_numParticles, Template, Frame, _Threshold, _HoldPercentage,_Alpha);
+                        pf = new ParticleFilter(_numParticles, Template, Frame, _Threshold, _HoldPercentage, _Alpha);
                     }
                     pf.processFrame(Frame);
-                    _FrameLock.Set();
+                    Frame.Dispose();
+                    Pause.WaitOne(100); //Prevents Jerky delayed webcam updates.
                 }
-                Pause.WaitOne(100);
             }
             _Filterstopping.Set();
         }
@@ -395,10 +411,10 @@ namespace MostlyHarmless
 
         private void btnFireRocket_Click(object sender, EventArgs e)
         {
-            _FrameLock.WaitOne();
-            _FrameLock.Reset();
+            _newFrame.WaitOne();
+            _newFrame.Reset();
             _Commander.Fire(1);
-            _FrameLock.Set();
+            _newFrame.Set();
         }
     }
 }
