@@ -270,9 +270,11 @@ namespace MostlyHarmless
             Pause.WaitOne(100);
             if (videoSource != null)
             {
-                videoSource.SignalToStop();
                 videoSource.NewFrame -= new NewFrameEventHandler(video_NewFrame);
-                videoSource.WaitForStop();
+                videoSource.SignalToStop();
+                Pause.WaitOne(2000);
+                //replaced with Sleep.  WaitforStop hangs for some reason.
+                //videoSource.WaitForStop();
                 videoSource = null;
             }
             
